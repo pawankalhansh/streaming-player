@@ -1,211 +1,149 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const path = require('path');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
 puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.static('public'));
 
 const DEFAULT_SOURCE = 'https://fcapi.amitbala1993.workers.dev/';
 
+const HEADER_PROFILES = {
+    fancode: { 'User-Agent': '@allinonereborn_links', 'Referer': 'https://fancode.com/', 'Origin': 'https://fancode.com', 'Accept': '*/*' },
+    default: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0.0.0 Safari/537.36', 'Referer': 'https://www.google.com/', 'Accept': '*/*', 'Accept-Language': 'en-US,en;q=0.9' }
+};
+
+function getHeadersForUrl(url, pipePart) {
+    let headers = url && url.includes('fancode.com') ? { ...HEADER_PROFILES.fancode } : { ...HEADER_PROFILES.default };
+    if (pipePart && pipePart !== 'none') {
+        try {
+            const cleaned = pipePart.replace(/^pipe=/, '').replace(/^b64:/, '');
+            const jsonStr = Buffer.from(cleaned, 'base64').toString('utf-8');
+            Object.entries(JSON.parse(jsonStr)).forEach(([k, v]) => {
+                const lk = k.toLowerCase();
+                if (lk === 'user-agent') headers['User-Agent'] = v;
+                else if (lk === 'referer') headers['Referer'] = v;
+                else if (lk === 'cookie') headers['Cookie'] = v;
+                else if (lk === 'origin') headers['Origin'] = v;
+                else headers[k] = v;
+            });
+        } catch (e) {}
+    }
+    return headers;
+}
+
 function universalParser(data) {
-    let streams = [];
+    const streams = [];
     const seenUrls = new Set();
+    const sourceHeaders = (data && typeof data === 'object' && !Array.isArray(data) && data.headers) ? data.headers : {};
     function findStreams(obj) {
         if (!obj || typeof obj !== 'object') return;
-        if (Array.isArray(obj)) { obj.forEach(val => findStreams(val)); return; }
+        if (Array.isArray(obj)) { obj.forEach(findStreams); return; }
         const streamKeywords = ['stream_url', 'url', 'link', 'm3u8', 'src', 'playback_url', 'live_url'];
-        const urlKey = streamKeywords.find(key => {
-            const val = obj[key];
-            return val && typeof val === 'string' && (val.startsWith('http') || val.includes('.m3u8'));
-        });
+        const urlKey = streamKeywords.find(k => { const v = obj[k]; return v && typeof v === 'string' && (v.startsWith('http') || v.includes('.m3u8')); });
         if (urlKey) {
-            const streamUrl = obj[urlKey];
-            if (!seenUrls.has(streamUrl)) {
-                seenUrls.add(streamUrl);
+            const rawUrl = obj[urlKey];
+            if (!seenUrls.has(rawUrl)) {
+                seenUrls.add(rawUrl);
+                let finalUrl = rawUrl;
+                if (Object.keys(sourceHeaders).length > 0) finalUrl += `|b64:${Buffer.from(JSON.stringify(sourceHeaders)).toString('base64')}`;
                 const titleKeys = ['match', 'title', 'name', 'label', 'display_name', 'match_name', 'tournament'];
                 const logoKeys = ['image', 'logo', 'thumb', 'poster', 'thumbnail', 'match_logo'];
                 const catKeys = ['category', 'genre', 'group', 'type'];
                 streams.push({
-                    url: streamUrl,
-                    name: obj[titleKeys.find(k => obj[k])] || 'Unknown Stream',
+                    url: finalUrl,
+                    name: obj[titleKeys.find(k => obj[k] && typeof obj[k] === 'string')] || 'Unknown Stream',
                     logo: obj[logoKeys.find(k => obj[k] && typeof obj[k] === 'string' && obj[k].startsWith('http'))] || '',
-                    group: obj[catKeys.find(k => obj[k])] || 'General'
+                    group: obj[catKeys.find(k => obj[k] && typeof obj[k] === 'string')] || 'General',
                 });
             }
         }
-        Object.values(obj).forEach(val => { if (val && typeof val === 'object') findStreams(val); });
+        Object.values(obj).forEach(v => { if (v && typeof v === 'object') findStreams(v); });
     }
     findStreams(data);
     return streams;
 }
 
 function parseM3U(content) {
-    const streams = [];
-    const lines = content.split('\n');
-    let currentStream = null;
-    let pendingHeaders = {};
-    let pendingDrm = {};
+    const streams = []; const lines = content.split('\n'); let cur = null, pH = {}, pD = {};
     lines.forEach(line => {
         line = line.trim();
-        if (line.startsWith('#EXTINF:')) {
-            const namePart = line.split(',').pop().trim();
-            const logoMatch = line.match(/tvg-logo="([^"]+)"/);
-            const groupMatch = line.match(/group-title="([^"]+)"/);
-            currentStream = { name: namePart || 'Unknown Channel', logo: logoMatch ? logoMatch[1] : '', group: groupMatch ? groupMatch[1] : 'General', url: '', drm: null };
-        } else if (line.startsWith('#EXTVLCOPT:')) {
-            const opt = line.replace('#EXTVLCOPT:', '').split('=');
-            if (opt.length >= 2) { pendingHeaders[opt[0].trim().replace('http-', '')] = opt.slice(1).join('=').trim(); }
-        } else if (line.startsWith('#EXTHTTP:')) {
-            try { Object.assign(pendingHeaders, JSON.parse(line.replace('#EXTHTTP:', ''))); } catch (e) {}
-        } else if (line.startsWith('#KODIPROP:')) {
-            const prop = line.replace('#KODIPROP:', '').split('=');
-            if (prop.length >= 2) {
-                const key = prop[0].trim(); const val = prop.slice(1).join('=').trim();
-                if (key.includes('license_type')) pendingDrm.type = val;
-                if (key.includes('license_key')) pendingDrm.key = val;
-            }
-        } else if (line.startsWith('http')) {
+        if (line.startsWith('#EXTINF:')) { cur = { name: line.split(',').pop().trim() || 'Unknown', logo: (line.match(/tvg-logo="([^"]+)"/) || [])[1] || '', group: (line.match(/group-title="([^"]+)"/) || [])[1] || 'General', url: '', drm: null }; }
+        else if (line.startsWith('#EXTVLCOPT:')) { const o = line.replace('#EXTVLCOPT:', '').split('='); if (o.length >= 2) pH[o[0].trim().replace('http-', '')] = o.slice(1).join('=').trim(); }
+        else if (line.startsWith('#EXTHTTP:')) { try { Object.assign(pH, JSON.parse(line.replace('#EXTHTTP:', ''))); } catch (e) {} }
+        else if (line.startsWith('#KODIPROP:')) { const p = line.replace('#KODIPROP:', '').split('='); if (p.length >= 2) { if (p[0].includes('license_type')) pD.type = p.slice(1).join('=').trim(); if (p[0].includes('license_key')) pD.key = p.slice(1).join('=').trim(); } }
+        else if (line.startsWith('http')) {
             let finalUrl = line;
-            if (Object.keys(pendingHeaders).length > 0) {
-                const b64Headers = Buffer.from(JSON.stringify(pendingHeaders)).toString('base64');
-                finalUrl += `|b64:${b64Headers}`;
-            }
-            if (currentStream) {
-                currentStream.url = finalUrl;
-                if (Object.keys(pendingDrm).length > 0) currentStream.drm = { ...pendingDrm };
-                streams.push(currentStream); currentStream = null;
-            } else {
-                streams.push({ name: 'Direct Stream', url: finalUrl, logo: '', group: 'General', drm: Object.keys(pendingDrm).length > 0 ? { ...pendingDrm } : null });
-            }
-            pendingHeaders = {}; pendingDrm = {};
+            if (Object.keys(pH).length > 0) finalUrl += `|b64:${Buffer.from(JSON.stringify(pH)).toString('base64')}`;
+            if (cur) { cur.url = finalUrl; if (Object.keys(pD).length > 0) cur.drm = { ...pD }; streams.push(cur); cur = null; }
+            else streams.push({ name: 'Direct Stream', url: finalUrl, logo: '', group: 'General', drm: Object.keys(pD).length > 0 ? { ...pD } : null });
+            pH = {}; pD = {};
         }
     });
     return streams;
 }
 
-const DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Referer': 'https://www.hotstar.com/',
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://www.hotstar.com'
-};
-
-function getHeadersFromPipe(pipePart) {
-    const headers = { ...DEFAULT_HEADERS };
-    if (!pipePart || pipePart === 'none') return headers;
-    try {
-        const cleaned = pipePart.replace(/^pipe=/, '').replace(/^b64:/, '');
-        const jsonStr = Buffer.from(cleaned, 'base64').toString('utf-8');
-        const jsonHeaders = JSON.parse(jsonStr);
-        Object.entries(jsonHeaders).forEach(([k, v]) => {
-            const lk = k.toLowerCase();
-            if (lk === 'user-agent') headers['User-Agent'] = v;
-            else if (lk === 'referer') headers['Referer'] = v;
-            else if (lk === 'cookie') headers['Cookie'] = v;
-            else if (lk === 'origin') headers['Origin'] = v;
-            else headers[k] = v;
-        });
-    } catch (e) { console.warn('[PipeHeaders] Parse error:', e.message); }
-    return headers;
-}
-
 app.get('/proxy', async (req, res) => {
-    const targetUrl = req.query.url;
-    const pipe = req.query.pipe || 'none';
+    const targetUrl = req.query.url; const pipe = req.query.pipe || 'none';
     if (!targetUrl) return res.status(400).send('URL required');
-    const headers = getHeadersFromPipe(pipe);
-    console.log(`[Proxy] Fetching: ${targetUrl.substring(0, 100)}...`);
+    const headers = getHeadersForUrl(targetUrl, pipe);
+    console.log(`[Proxy] ${targetUrl.substring(0, 90)}`);
     try {
-        const response = await axios({ method: 'get', url: targetUrl, headers, responseType: 'arraybuffer', timeout: 25000, maxRedirects: 5 });
-        let content = response.data;
-        let contentType = (response.headers['content-type'] || '').toLowerCase();
-        const targetBase = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+        const resp = await axios({ method: 'get', url: targetUrl, headers, responseType: 'arraybuffer', timeout: 25000, maxRedirects: 10 });
+        const content = resp.data; const ct = (resp.headers['content-type'] || '').toLowerCase();
+        const base = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
         res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Headers', '*');
-        if (targetUrl.includes('.m3u8') || contentType.includes('mpegurl') || contentType.includes('m3u')) {
-            let m3u8Text = content.toString('utf8');
-            const processedLines = m3u8Text.split('\n').map(line => {
-                const trimmed = line.trim();
-                if (trimmed === '') return '';
-                if (trimmed.startsWith('#')) {
-                    return trimmed.replace(/URI="([^"]+)"/g, (match, p1) => {
-                        const abs = p1.startsWith('http') ? p1 : new URL(p1, targetBase).href;
-                        return `URI="${abs}"`;
-                    });
-                }
-                return trimmed.startsWith('http') ? trimmed : new URL(trimmed, targetBase).href;
+        if (targetUrl.includes('.m3u8') || ct.includes('mpegurl') || ct.includes('m3u')) {
+            const lines = content.toString('utf8').split('\n').map(line => {
+                const t = line.trim(); if (!t) return '';
+                if (t.startsWith('#')) return t.replace(/URI="([^"]+)"/g, (_, p) => `URI="${p.startsWith('http') ? p : new URL(p, base).href}"`);
+                return t.startsWith('http') ? t : new URL(t, base).href;
             });
-            res.setHeader('Content-Type', 'application/x-mpegURL');
-            return res.send(processedLines.join('\n'));
+            res.setHeader('Content-Type', 'application/x-mpegURL'); return res.send(lines.join('\n'));
         }
-        if (targetUrl.includes('.mpd') || contentType.includes('dash+xml') || contentType.includes('text/xml') || contentType.includes('application/xml')) {
+        if (targetUrl.includes('.mpd') || ct.includes('dash') || ct.includes('xml')) {
             let xml = content.toString('utf8');
-            if (!xml.includes('<BaseURL>')) {
-                xml = xml.replace(/<MPD([^>]*)>/, `<MPD$1>\n  <BaseURL>${targetBase}</BaseURL>`);
-            }
-            res.setHeader('Content-Type', 'application/dash+xml');
-            return res.send(xml);
+            if (!xml.includes('<BaseURL>')) xml = xml.replace(/<MPD([^>]*)>/, `<MPD$1>\n  <BaseURL>${base}</BaseURL>`);
+            res.setHeader('Content-Type', 'application/dash+xml'); return res.send(xml);
         }
-        res.setHeader('Content-Type', contentType || 'application/octet-stream');
-        res.send(content);
-    } catch (error) {
-        console.error(`[Proxy Fail] ${targetUrl.substring(0, 80)}: ${error.message}`);
-        res.status(error.response ? error.response.status : 500).send(error.message);
-    }
+        res.setHeader('Content-Type', ct || 'application/octet-stream'); res.send(content);
+    } catch (e) { console.error(`[Proxy Fail] ${e.message}`); res.status(e.response ? e.response.status : 500).send(e.message); }
 });
 
 app.get('/playlist', async (req, res) => {
-    const rawUrl = req.query.url || DEFAULT_SOURCE;
-    const parts = rawUrl.split('|');
-    const baseUrl = parts[0];
-    const headers = parts.length > 1 ? getHeadersFromPipe(parts[1]) : { ...DEFAULT_HEADERS };
+    const rawUrl = req.query.url || DEFAULT_SOURCE; const [baseUrl, pipe] = rawUrl.split('|');
     try {
-        const response = await axios.get(baseUrl, { headers, timeout: 15000 });
-        const streams = universalParser(response.data);
-        let m3u8 = "#EXTM3U\n";
-        streams.forEach((s, i) => { m3u8 += `#EXTINF:-1 tvg-id="s${i}" tvg-name="${s.name}" tvg-logo="${s.logo}" group-title="${s.group}", ${s.name}\n${s.url}\n\n`; });
-        res.setHeader('Content-Type', 'application/x-mpegURL');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.send(m3u8);
-    } catch (error) { res.status(500).send(`Error: ${error.message}`); }
+        const resp = await axios.get(baseUrl, { headers: getHeadersForUrl(baseUrl, pipe), timeout: 15000 });
+        const streams = universalParser(resp.data);
+        let m3u = '#EXTM3U\n';
+        streams.forEach((s, i) => { m3u += `#EXTINF:-1 tvg-id="s${i}" tvg-name="${s.name}" tvg-logo="${s.logo}" group-title="${s.group}", ${s.name}\n${s.url}\n\n`; });
+        res.setHeader('Content-Type', 'application/x-mpegURL'); res.setHeader('Access-Control-Allow-Origin', '*'); res.send(m3u);
+    } catch (e) { res.status(500).send(`Error: ${e.message}`); }
 });
 
 app.get('/api/status', async (req, res) => {
-    const rawUrl = req.query.url || DEFAULT_SOURCE;
-    const parts = rawUrl.split('|');
-    const baseUrl = parts[0];
-    const headers = parts.length > 1 ? getHeadersFromPipe(parts[1]) : { ...DEFAULT_HEADERS };
+    const rawUrl = req.query.url || DEFAULT_SOURCE; const [baseUrl, pipe] = rawUrl.split('|');
     try {
-        const response = await axios.get(baseUrl, { headers, timeout: 15000 });
-        const streams = universalParser(response.data);
+        const resp = await axios.get(baseUrl, { headers: getHeadersForUrl(baseUrl, pipe), timeout: 15000 });
+        const streams = universalParser(resp.data);
         res.json({ success: true, total: streams.length, streams });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.get('/api/parse-m3u', async (req, res) => {
     if (!req.query.url) return res.status(400).json({ success: false, error: 'URL required' });
     try {
-        const response = await axios.get(req.query.url, {
-            headers: { ...DEFAULT_HEADERS, 'Accept': 'text/plain, */*' },
-            timeout: 20000, maxRedirects: 10
-        });
-        let content = response.data;
-        if (typeof content === 'object') {
-            const streams = universalParser(content);
-            return res.json({ success: true, total: streams.length, streams });
-        }
+        const headers = { ...HEADER_PROFILES.default, 'Accept': 'text/plain, */*' };
+        const resp = await axios.get(req.query.url, { headers, timeout: 20000, maxRedirects: 10 });
+        const content = resp.data;
+        if (typeof content === 'object') return res.json({ success: true, total: 0, streams: universalParser(content) });
         const streams = parseM3U(String(content));
         res.json({ success: true, total: streams.length, streams });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.get('/api/scrape', async (req, res) => {
@@ -213,34 +151,23 @@ app.get('/api/scrape', async (req, res) => {
     if (!targetUrl) return res.status(400).json({ success: false, error: 'URL required' });
     let browser;
     try {
-        // Use system Chromium if available (Docker/Railway), else download
-        const launchOptions = {
-            headless: "new",
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-        };
-        if (process.env.PUPPETEER_EXECUTABLE_PATH) {
-            launchOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
-        }
-        browser = await puppeteer.launch(launchOptions);
+        const opts = { headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] };
+        if (process.env.PUPPETEER_EXECUTABLE_PATH) opts.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+        browser = await puppeteer.launch(opts);
         const page = await browser.newPage();
-        await page.setUserAgent(DEFAULT_HEADERS['User-Agent']);
-        const discoveredLinks = new Set();
+        await page.setUserAgent(HEADER_PROFILES.default['User-Agent']);
+        const found = new Set();
         await page.setRequestInterception(true);
-        page.on('request', interceptedReq => {
-            const url = interceptedReq.url();
-            if (url.includes('.m3u8') || url.includes('.mpd')) discoveredLinks.add(url);
-            interceptedReq.continue();
-        });
+        page.on('request', r => { const u = r.url(); if (u.includes('.m3u8') || u.includes('.mpd')) found.add(u); r.continue(); });
         await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-        const selectors = ['button[aria-label="Play"]', '.play-button', 'video', '[class*="play"]'];
-        for (const s of selectors) {
+        for (const s of ['button[aria-label="Play"]', '.play-button', 'video', '[class*="play"]']) {
             try { const el = await page.$(s); if (el) { await el.click(); await new Promise(r => setTimeout(r, 4000)); break; } } catch (e) {}
         }
         await new Promise(r => setTimeout(r, 8000));
-        const links = Array.from(discoveredLinks).map(l => ({ url: l, name: 'Scraped Stream', logo: '', group: l.includes('.mpd') ? 'DASH' : 'HLS' }));
+        const links = Array.from(found).map(l => ({ url: l, name: 'Scraped Stream', logo: '', group: l.includes('.mpd') ? 'DASH' : 'HLS' }));
         res.json({ success: true, count: links.length, streams: links, links });
-    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
     finally { if (browser) await browser.close(); }
 });
 
-app.listen(PORT, () => { console.log(`✅ Server running at http://localhost:${PORT}`); });
+app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
